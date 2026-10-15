@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+site/
+.tox/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 打包产物
+*.spec.bak
+packaging/__pycache__/
+
+# 二进制工具（用户自行放置）
+bin/*
+!bin/.gitkeep
+
+# 本地配置与数据（含 API key，勿提交）
+*.local.toml
+.cache/
+.pytest_cache/
+
+# 日志
+*.log
