@@ -139,6 +139,17 @@ def _validate(cfg: Config) -> None:
     )
 
 
+def _exclude_quarantine_from_scan(cfg: Config) -> None:
+    """把隔离目录并入扫描排除列表。
+
+    隔离目录是工具自己维护的"回收站"，若被当成曲库的一部分扫描，
+    重复组里会出现已隔离的文件，后续 apply 甚至可能把完好的副本移走。
+    """
+    name = cfg.dedup.quarantine_dir.strip().strip("\\/")
+    if name and name not in cfg.scan.exclude_dirs:
+        cfg.scan.exclude_dirs.append(name)
+
+
 def load_config() -> Config:
     """加载配置，文件不存在时返回默认配置。"""
     cfg = Config()
@@ -147,6 +158,7 @@ def load_config() -> Config:
         with path.open("rb") as f:
             data: dict[str, Any] = tomllib.load(f)
         _apply_dict(cfg, data)
+    _exclude_quarantine_from_scan(cfg)
     _validate(cfg)
     _resolve_frozen_paths(cfg)
     _ensure_dirs(cfg)

@@ -91,7 +91,8 @@ class Scraper:
             )
             if scraped:
                 results[fp_result.fingerprint] = scraped
-                self.db.set_metadata(fp_result.fingerprint, scraped.__dict__)
+                if definitive:
+                    self.db.set_metadata(fp_result.fingerprint, scraped.__dict__)
             elif definitive:
                 # 请求成功但库里没有收录：记一条负结果，别每次扫描都重发
                 self.db.set_metadata(fp_result.fingerprint, {"recording_id": None})
@@ -141,7 +142,9 @@ class Scraper:
             if cover:
                 meta.cover_url = cover
 
-        return meta, True
+        # MusicBrainz 没拿到时不要缓存：缓存的是"已有结论"，
+        # 只有 recording_id 的空壳会让下次运行直接拿它当命中结果。
+        return meta, mb_data is not None
 
     def _lookup_acoustid(
         self, fingerprint: str, duration: Optional[float]
@@ -187,19 +190,34 @@ class Scraper:
         return None, 0.0, True
 
     def _lookup_musicbrainz(self, recording_id: str) -> Optional[dict[str, Any]]:
-        """通过 MusicBrainz API 获取录音详情。"""
-        self._rate_limit_mb()
+        """通过 MusicBrainz API 获取录音详情。
 
+        MusicBrainz 在负载高时会返回 503（带 Retry-After），并非永久失败；
+        这里最多重试 3 次，仍失败才返回 None（调用方据此决定不缓存该结果）。
+        """
         headers = {"User-Agent": self.config.musicbrainz_user_agent}
         params = {"inc": "artists+releases+genres", "fmt": "json"}
         url = MUSICBRAINZ_URL.format(rid=recording_id)
 
-        try:
-            resp = self._session.get(url, params=params, headers=headers, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning(f"MusicBrainz 请求失败: {e}")
+        data: Optional[dict[str, Any]] = None
+        for attempt in range(3):
+            self._rate_limit_mb()
+            try:
+                resp = self._session.get(url, params=params, headers=headers, timeout=30)
+                if resp.status_code in (429, 503):
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else 2.0
+                    time.sleep(min(max(delay, 1.0), 10.0))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                logger.warning(f"MusicBrainz 请求失败: {e}")
+                return None
+
+        if data is None:
+            logger.warning(f"MusicBrainz 多次 503，稍后可重试: {recording_id}")
             return None
 
         result: dict[str, Any] = {}
