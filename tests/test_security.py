@@ -502,6 +502,37 @@ def test_apply_dry_run_no_move() -> None:
         check("P2-13 dry-run 仍给出预览计划", len(plans) == 1, f"计划数={len(plans)}")
 
 
+def test_network_path_never_goes_to_trash() -> None:
+    """网络共享必须直接隔离：send2trash 在 UNC 上会「成功」地永久删除文件。"""
+    check("_is_network_path 识别 UNC 路径",
+          action._is_network_path(Path(r"\\server\share\a.wav")))
+    tmp = Path(tempfile.mkdtemp())
+    local = tmp / "song.wav"
+    local.write_bytes(b"x" * 10)
+    check("_is_network_path 不把本地路径误判为网络", not action._is_network_path(local))
+
+    calls: list[str] = []
+    original_send, original_isnet = action.send2trash, action._is_network_path
+    try:
+        action.send2trash = lambda p: calls.append(str(p))
+        action._is_network_path = lambda p: True
+        qdir = tmp / "q"
+        result = action.move_to_trash(local, qdir)
+        no_qdir = tmp / "no_q"
+        (tmp / "b.wav").write_bytes(b"y" * 5)
+        result_no_q = action.move_to_trash(tmp / "b.wav", None)
+    finally:
+        action.send2trash, action._is_network_path = original_send, original_isnet
+
+    check("网络路径不调用 send2trash", calls == [], f"调用={calls}")
+    check("网络路径走隔离并标记 quarantined", result.success and result.quarantined, result.message)
+    check("隔离目录里确有文件", (qdir / "song.wav").exists())
+    check("无隔离目录时拒绝删除而非静默删除",
+          (not result_no_q.success) and (tmp / "b.wav").exists(), result_no_q.message)
+    check("无隔离目录时不创建多余目录", not no_qdir.exists())
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_contract_constants() -> None:
     """附加：锁定接口常量本身也要符合约定，避免后续实现跑偏。"""
     check("contract.SCHEMA_VERSION == 1", SCHEMA_VERSION == 1, str(SCHEMA_VERSION))
@@ -527,6 +558,7 @@ def main() -> int:
     test_quarantine_accounting()
     test_tagwriter_init_no_side_effect()
     test_apply_dry_run_no_move()
+    test_network_path_never_goes_to_trash()
     test_contract_constants()
 
     failed = [name for name, ok, _ in checks if not ok]

@@ -26,16 +26,68 @@ class ActionResult:
     quarantined_size: int = 0
 
 
+def _is_network_path(path: Path) -> bool:
+    """判断路径是否位于网络共享（UNC 路径，或映射到网络位置的驱动器）。
+
+    Windows 回收站不覆盖网络共享：send2trash 在 UNC 路径上往往**不报错**、
+    直接把文件永久删除，异常兜底不会触发。这类路径必须跳过回收站。
+    """
+    drive = path.drive
+    if drive.startswith("\\\\"):
+        return True
+    if os.name != "nt" or not drive:
+        return False
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\") == 4  # DRIVE_REMOTE
+    except Exception:
+        return False
+
+
+def _move_to_quarantine(
+    path: Path, size: int, quarantine_dir: Path, reason: str
+) -> ActionResult:
+    """把文件移入隔离目录，失败时如实报告，绝不静默删除。"""
+    try:
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        destination = _unique_destination(quarantine_dir / path.name)
+        shutil.move(str(path), str(destination))
+        logger.info(f"{reason}，已移入隔离目录: {path} -> {destination}")
+        return ActionResult(
+            path=path,
+            success=True,
+            message=f"{reason}，已移入隔离目录: {destination}",
+            # 同盘移动并未释放空间，只记为隔离占用
+            freed_size=0,
+            quarantined=True,
+            quarantined_size=size,
+        )
+    except Exception as move_exc:
+        logger.error(f"移入隔离目录失败 [{path}]: {move_exc}")
+        return ActionResult(path=path, success=False, message=f"{reason}; 移入隔离目录失败: {move_exc}")
+
+
 def move_to_trash(path: Path, quarantine_dir: Path | None = None) -> ActionResult:
     """将单个文件移到回收站。
 
-    回收站不可用时（例如 UNC 网络共享，Windows 的回收站 API 不支持网络路径）
-    退回到隔离目录，保证文件不会被误删。
+    网络共享（UNC 或映射的网络驱动器）上回收站不可用，直接改走隔离目录；
+    其他位置回收站失败时同样退回到隔离目录，保证文件不会被误删。
     """
     if not path.exists():
         return ActionResult(path=path, success=False, message="文件不存在")
 
     size = path.stat().st_size
+    if _is_network_path(path):
+        if quarantine_dir is None:
+            logger.warning(f"网络共享不支持回收站，且未配置隔离目录 [{path}]: 已跳过")
+            return ActionResult(
+                path=path,
+                success=False,
+                message="网络共享不支持回收站，且未配置隔离目录，已跳过（未删除）",
+            )
+        return _move_to_quarantine(path, size, quarantine_dir, "网络共享不支持回收站")
+
     try:
         send2trash(str(path))
         logger.info(f"已移到回收站: {path} ({human_size(size)})")
@@ -44,27 +96,7 @@ def move_to_trash(path: Path, quarantine_dir: Path | None = None) -> ActionResul
         logger.warning(f"移到回收站失败 [{path}]: {exc}")
         if quarantine_dir is None:
             return ActionResult(path=path, success=False, message=str(exc))
-        try:
-            quarantine_dir.mkdir(parents=True, exist_ok=True)
-            destination = _unique_destination(quarantine_dir / path.name)
-            shutil.move(str(path), str(destination))
-            logger.info(f"回收站不可用，已移入隔离目录: {path} -> {destination}")
-            return ActionResult(
-                path=path,
-                success=True,
-                message=f"回收站不可用，已移入隔离目录: {destination}",
-                # 同盘移动并未释放空间，只记为隔离占用
-                freed_size=0,
-                quarantined=True,
-                quarantined_size=size,
-            )
-        except Exception as move_exc:
-            logger.error(f"移入隔离目录也失败 [{path}]: {move_exc}")
-            return ActionResult(
-                path=path,
-                success=False,
-                message=f"{exc}; 移入隔离目录失败: {move_exc}",
-            )
+        return _move_to_quarantine(path, size, quarantine_dir, "回收站不可用")
 
 
 def _unique_destination(candidate: Path) -> Path:
