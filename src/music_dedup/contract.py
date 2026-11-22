@@ -99,9 +99,14 @@ def _path_under_roots(raw_path: str, roots: list[str], label: str) -> Path:
             common = os.path.commonpath([normalized, root])
         except ValueError:
             continue
-        if os.path.normcase(common) != root:
+        # 归一化后的 UNC 共享根（\\host\share\）与盘符根（C:\）都保留末尾分隔符，
+        # 直接拼 root + os.sep 会得到双分隔符，startswith 永不成立（扫共享根时会误拒）。
+        # 统一去掉末尾分隔符后再比较，归属判断用「去掉尾分隔符 + 一个分隔符」做前缀。
+        root_base = os.path.normcase(root).rstrip("\\/")
+        common_base = os.path.normcase(common).rstrip("\\/")
+        if common_base != root_base:
             continue
-        if normalized == root or normalized.startswith(root + os.sep):
+        if normalized == root_base or normalized.startswith(root_base + os.sep):
             return Path(absolute)
     raise ReportValidationError(
         f"{label}: 路径不在任何 scan_roots 范围内，已拒绝: {raw_path}"
