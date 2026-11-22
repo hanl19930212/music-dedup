@@ -104,30 +104,42 @@ def scan_directory(root: Path, config: ScanConfig) -> list[AudioFile]:
     exclude_set = set(config.exclude_dirs)
 
     results: list[AudioFile] = []
-    try:
-        for dirpath, dirnames, filenames in normalized.walk(on_error=_on_walk_error):
-            # 原地修改 dirnames 以跳过排除目录
-            dirnames[:] = [d for d in dirnames if d not in exclude_set and not d.startswith(".")]
-
-            for filename in filenames:
-                ext = get_file_ext(Path(filename))
-                if ext in ext_set:
-                    full_path = dirpath / filename
+    # 用 os.scandir 而不是 os.walk：目录项的大小/修改时间来自同一次目录枚举
+    # （Windows 上 FindFirstFile 就带回来了），不必再对每个文件单独 stat()。
+    # 网络共享上每个 syscall 都是几毫秒，几千个文件时会差出十几秒。
+    stack = [str(normalized)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
                     try:
-                        stat = full_path.stat()
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name in exclude_set or entry.name.startswith("."):
+                                continue
+                            stack.append(entry.path)
+                            continue
+                        ext = Path(entry.name).suffix.lower().lstrip(".")
+                        if ext not in ext_set:
+                            continue
+                        stat = entry.stat()
                         results.append(
                             AudioFile(
-                                path=full_path,
+                                path=Path(entry.path),
                                 size=stat.st_size,
                                 mtime=stat.st_mtime,
                             )
                         )
                     except OSError:
                         # 无法访问的文件跳过（权限不足等）
-                        logger.debug(f"跳过无法访问的文件: {full_path}")
+                        logger.debug(f"跳过无法访问的文件: {entry.path}")
                         continue
-    except PermissionError as e:
-        raise PermissionError(f"权限不足，无法访问目录: {normalized}") from e
+        except PermissionError as e:
+            if current == str(normalized):
+                raise PermissionError(f"权限不足，无法访问目录: {normalized}") from e
+            logger.warning(f"目录访问警告: {e}")
+        except OSError as e:
+            logger.warning(f"目录访问警告: {e}")
 
     return results
 
@@ -141,8 +153,11 @@ def scan_directories(roots: list[Path], config: ScanConfig) -> list[AudioFile]:
             files = scan_directory(root, config)
             console_print(f"  {root}: {len(files)} 个文件")
             for f in files:
-                # 以绝对路径去重，避免同一文件被多个入口重复扫描
-                all_files[f.path.resolve()] = f
+                # 以绝对路径去重，避免同一文件被多个入口重复扫描。
+                # 用 abspath 而不是 Path.resolve()：后者在 Windows 上会逐级访问
+                # 文件系统，UNC 路径上实测约 5ms/文件，几千个文件就是十几秒。
+                key = os.path.normcase(os.path.abspath(str(f.path)))
+                all_files[key] = f
         except (FileNotFoundError, PermissionError, ValueError) as e:
             logger.error(f"扫描跳过 [{root}]: {e}")
             console_print(f"[yellow]跳过 {root}: {e}[/]")
@@ -155,11 +170,6 @@ def console_print(text: str) -> None:
     from rich.console import Console
 
     Console().print(text)
-
-
-def _on_walk_error(error: OSError) -> None:
-    """walk 遇到错误时的回调。"""
-    logger.warning(f"目录访问警告: {error}")
 
 
 def _network_path_error(path: Path) -> Exception:

@@ -6,7 +6,8 @@ setlocal
 
 echo === 1. 检查外部工具 ===
 if not exist "%~dp0bin\fpcalc.exe" echo [警告] 缺少 bin\fpcalc.exe，运行时会报错
-if not exist "%~dp0bin\ffmpeg.exe" echo [警告] 缺少 bin\ffmpeg.exe，fpcalc 可能无法解码
+REM 官方发布的 fpcalc 已内置 FFmpeg 解码库，ffmpeg.exe 只是可选备份
+if not exist "%~dp0bin\ffmpeg.exe" echo [提示] 未放置 bin\ffmpeg.exe（官方 fpcalc 自带解码库，可不放）
 
 echo.
 echo === 2. 安装依赖 ===

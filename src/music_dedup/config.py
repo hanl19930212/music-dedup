@@ -1,6 +1,7 @@
 """配置加载模块。
 
-优先级：CLI 参数 > 环境变量 > 配置文件 > 默认值。
+优先级：CLI 参数 > 配置文件 > 默认值。
+环境变量目前仅 MUSIC_DEDUP_CONFIG 生效，用于指定配置文件路径。
 """
 
 from __future__ import annotations
@@ -16,17 +17,21 @@ try:
 except ImportError:  # Python < 3.11 fallback
     tomllib = None  # type: ignore
 
-import tomli_w
 
+from .utils import logger
 
-SUPPORTED_EXTENSIONS = ("dsf", "wav", "flac", "mp3")
+SUPPORTED_EXTENSIONS = ("dsf", "dff", "wav", "flac", "aif", "aiff", "wma", "mp3")
 
 # 保留优先级：数值越小优先级越高
 FORMAT_PRIORITY: dict[str, int] = {
-    "dsf": 0,
-    "wav": 1,
-    "flac": 2,
-    "mp3": 3,
+    "dff": 0,
+    "dsf": 1,
+    "wav": 2,
+    "aif": 3,
+    "aiff": 3,
+    "flac": 4,
+    "wma": 5,
+    "mp3": 6,
 }
 
 DEFAULT_CONFIG_DIR = Path.home() / ".music-dedup"
@@ -54,8 +59,16 @@ class FingerprintConfig:
 
 @dataclass
 class DedupConfig:
-    min_similarity: float = 0.95
+    # 指纹相似阈值：实测同一录音的不同编码约 0.87~1.0，
+    # 现场版与录音室版约 0.56，完全不同的歌约 0.55
+    min_similarity: float = 0.83
     name_fallback: bool = True
+    # 指纹相似比较允许的时长差（秒）。这只是候选粗筛：
+    # 同一录音的不同发行版本常因前后静音不同差出十几秒，最终仍由相似度阈值把关
+    fingerprint_duration_tolerance: float = 30.0
+    # 回收站不可用时（例如 UNC 网络共享）的兜底隔离目录
+    quarantine_dir: str = "_music_duplicates_quarantine"
+    fallback_to_quarantine: bool = True
 
 
 @dataclass
@@ -92,6 +105,40 @@ def _ensure_dirs(cfg: Config) -> None:
     cfg.backup_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _validate(cfg: Config) -> None:
+    """校验配置取值范围，避免非法值在运行期才以晦涩错误暴露。
+
+    min_similarity 允许 1.0：这是 README 里「关闭相似匹配」的既定用法。
+    """
+    def _check(condition: bool, name: str, value: object) -> None:
+        if not condition:
+            raise ValueError(f"配置项 {name} 取值非法: {value!r}")
+
+    _check(cfg.fingerprint.workers >= 1, "fingerprint.workers", cfg.fingerprint.workers)
+    _check(cfg.fingerprint.duration > 0, "fingerprint.duration", cfg.fingerprint.duration)
+    _check(
+        0.0 <= cfg.dedup.min_similarity <= 1.0,
+        "dedup.min_similarity",
+        cfg.dedup.min_similarity,
+    )
+    _check(
+        cfg.dedup.fingerprint_duration_tolerance >= 0,
+        "dedup.fingerprint_duration_tolerance",
+        cfg.dedup.fingerprint_duration_tolerance,
+    )
+    _check(
+        cfg.scrape.rate_limit_delay >= 0,
+        "scrape.rate_limit_delay",
+        cfg.scrape.rate_limit_delay,
+    )
+    _check(cfg.scrape.cover_size > 0, "scrape.cover_size", cfg.scrape.cover_size)
+    _check(
+        bool(cfg.dedup.quarantine_dir.strip()),
+        "dedup.quarantine_dir",
+        cfg.dedup.quarantine_dir,
+    )
+
+
 def load_config() -> Config:
     """加载配置，文件不存在时返回默认配置。"""
     cfg = Config()
@@ -100,6 +147,7 @@ def load_config() -> Config:
         with path.open("rb") as f:
             data: dict[str, Any] = tomllib.load(f)
         _apply_dict(cfg, data)
+    _validate(cfg)
     _resolve_frozen_paths(cfg)
     _ensure_dirs(cfg)
     return cfg
@@ -154,6 +202,12 @@ def _apply_dict(cfg: Config, data: dict[str, Any]) -> None:
         cfg.dedup.min_similarity = float(dd["min_similarity"])
     if "name_fallback" in dd:
         cfg.dedup.name_fallback = bool(dd["name_fallback"])
+    if "fingerprint_duration_tolerance" in dd:
+        cfg.dedup.fingerprint_duration_tolerance = float(dd["fingerprint_duration_tolerance"])
+    if "quarantine_dir" in dd:
+        cfg.dedup.quarantine_dir = str(dd["quarantine_dir"])
+    if "fallback_to_quarantine" in dd:
+        cfg.dedup.fallback_to_quarantine = bool(dd["fallback_to_quarantine"])
 
     sc = data.get("scrape", {})
     if "acoustid_api_key" in sc:
@@ -167,12 +221,33 @@ def _apply_dict(cfg: Config, data: dict[str, Any]) -> None:
     if "rate_limit_delay" in sc:
         cfg.scrape.rate_limit_delay = float(sc["rate_limit_delay"])
 
-    if "cache_file" in data:
-        cfg.cache_file = Path(data["cache_file"])
-    if "log_dir" in data:
-        cfg.log_dir = Path(data["log_dir"])
-    if "backup_dir" in data:
-        cfg.backup_dir = Path(data["backup_dir"])
+    # 缓存与日志路径必须写在所有 [段] 之前才是顶层键。
+    # 历史上（以及 README 的示例里）它们被放在 [scrape] 段末尾，
+    # TOML 会把它们解析成 scrape 的子键而读不到，这里做兼容。
+    for key in ("cache_file", "log_dir", "backup_dir"):
+        value = _top_level_path(data, key)
+        if value is None:
+            continue
+        expanded = Path(value).expanduser()
+        if key == "cache_file":
+            cfg.cache_file = expanded
+        elif key == "log_dir":
+            cfg.log_dir = expanded
+        else:
+            cfg.backup_dir = expanded
+
+
+def _top_level_path(data: dict[str, Any], key: str) -> str | None:
+    """读取顶层路径配置；兼容被误放进某个 [段] 里的情况。"""
+    if key in data:
+        return str(data[key])
+    for section, table in data.items():
+        if isinstance(table, dict) and key in table:
+            logger.warning(
+                f"配置项 {key} 写在了 [{section}] 段内，应移到文件顶层（所有 [段] 之前），已按兼容方式读取"
+            )
+            return str(table[key])
+    return None
 
 
 def save_default_config() -> Path:
@@ -186,10 +261,16 @@ def save_default_config() -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     content = '''# music-dedup 配置文件
+
+# 缓存与日志（必须写在所有 [段] 之前，否则会被当成段内的键而读不到）
+cache_file = "''' + str(DEFAULT_CACHE_FILE).replace("\\", "\\\\") + '''"
+log_dir = "''' + str(DEFAULT_LOG_DIR).replace("\\", "\\\\") + '''"
+backup_dir = "''' + str(DEFAULT_BACKUP_DIR).replace("\\", "\\\\") + '''"
+
 # 扫描相关
 [scan]
 # 支持的音频格式
-extensions = ["dsf", "wav", "flac", "mp3"]
+extensions = ["dsf", "dff", "wav", "flac", "aif", "aiff", "wma", "mp3"]
 # 扫描时跳过的目录名
 exclude_dirs = ["@eaDir", ".Trash", "System Volume Information", "$RECYCLE.BIN"]
 # 预定义扫描目录，可包含本地路径和 UNC 网络共享路径
@@ -205,8 +286,11 @@ ffmpeg_path = ""                # ffmpeg 路径（或所在目录）；fpcalc �
 
 # 去重
 [dedup]
-min_similarity = 0.95   # 指纹相似度阈值
+min_similarity = 0.83   # 指纹相似度阈值
 name_fallback = true    # 指纹失败时是否用文件名兜底
+fingerprint_duration_tolerance = 30.0  # 指纹相似比较允许的时长差（秒），仅作候选粗筛
+quarantine_dir = "_music_duplicates_quarantine"  # 回收站不可用时的兜底隔离目录
+fallback_to_quarantine = true   # 移入回收站失败时改用隔离目录
 
 # 元数据刮削
 [scrape]
@@ -215,11 +299,6 @@ musicbrainz_user_agent = "music-dedup/0.1 (https://github.com/music-dedup)"
 fetch_cover = true
 cover_size = 600
 rate_limit_delay = 1.0  # MusicBrainz 请求间隔（秒）
-
-# 缓存与日志
-cache_file = "''' + str(DEFAULT_CACHE_FILE).replace("\\", "\\\\") + '''"
-log_dir = "''' + str(DEFAULT_LOG_DIR).replace("\\", "\\\\") + '''"
-backup_dir = "''' + str(DEFAULT_BACKUP_DIR).replace("\\", "\\\\") + '''"
 '''
     path.write_text(content, encoding="utf-8")
     return path

@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3
-from mutagen.mp3 import MP3
+from mutagen.asf import ASF, ASFUnicodeAttribute
 from mutagen.flac import FLAC
-from mutagen.wave import WAVE
-from mutagen.dsf import DSF
+from mutagen.mp3 import MP3
 
 from .utils import get_file_ext, logger
 
@@ -34,10 +32,6 @@ class AudioMetadata:
     bits_per_sample: Optional[int] = None
     has_cover: bool = False
 
-    # 规范化后的比较字段
-    norm_title: str = ""
-    norm_artist: str = ""
-
     @property
     def ext(self) -> str:
         return get_file_ext(self.path)
@@ -49,17 +43,20 @@ def _get_first(tags, keys: list[str]) -> Optional[str]:
         val = tags.get(key)
         if val:
             if isinstance(val, list):
-                if val and val[0]:
-                    return str(val[0])
-            else:
-                return str(val)
+                if not val:
+                    continue
+                val = val[0]
+            if isinstance(val, ASFUnicodeAttribute):
+                val = val.value
+            if val:
+                return str(val).strip()
     return None
 
 
 def read_metadata(path: Path) -> AudioMetadata:
     """读取音频文件的元数据。
 
-    支持 mp3(ID3)、flac(Vorbis)、wav(ID3)、dsf(ID3)。
+    支持 mp3(ID3)、flac(Vorbis)、wav/dsf/dff/aif(ID3)、wma(ASF)。
     读取失败时返回仅含 path 的对象。
     """
     meta = AudioMetadata(path=path)
@@ -109,7 +106,7 @@ def read_metadata(path: Path) -> AudioMetadata:
             meta.track = _get_first(tags, ["tracknumber"])
             if isinstance(audio, FLAC):
                 meta.has_cover = len(audio.pictures) > 0
-    elif ext in ("wav", "dsf"):
+    elif ext in ("wav", "dsf", "dff"):
         tags = getattr(audio, "tags", None)
         if tags:
             meta.title = _get_first(tags, ["TIT2"])
@@ -122,11 +119,28 @@ def read_metadata(path: Path) -> AudioMetadata:
                 if frame_key.startswith("APIC"):
                     meta.has_cover = True
                     break
-
-    # 规范化比较字段
-    from .utils import normalize_filename
-
-    meta.norm_title = normalize_filename(meta.title) if meta.title else ""
-    meta.norm_artist = normalize_filename(meta.artist) if meta.artist else ""
+    elif ext in ("aif", "aiff"):
+        tags = getattr(audio, "tags", None)
+        if tags:
+            meta.title = _get_first(tags, ["TIT2"])
+            meta.artist = _get_first(tags, ["TPE1"])
+            meta.album = _get_first(tags, ["TALB"])
+            meta.genre = _get_first(tags, ["TCON"])
+            meta.year = _get_first(tags, ["TDRC", "TYER"])
+            meta.track = _get_first(tags, ["TRCK"])
+            for frame_key in tags:
+                if frame_key.startswith("APIC"):
+                    meta.has_cover = True
+                    break
+    elif ext == "wma":
+        tags = audio.tags if isinstance(audio, ASF) else getattr(audio, "tags", None)
+        if tags:
+            meta.title = _get_first(tags, ["Title", "WM/Title"])
+            meta.artist = _get_first(tags, ["Author", "WM/AlbumArtist"])
+            meta.album = _get_first(tags, ["Album", "WM/AlbumTitle"])
+            meta.genre = _get_first(tags, ["Genre", "WM/Genre"])
+            meta.year = _get_first(tags, ["WM/Year"])
+            meta.track = _get_first(tags, ["WM/TrackNumber", "WM/Track"])
+            meta.has_cover = "WM/Picture" in tags
 
     return meta

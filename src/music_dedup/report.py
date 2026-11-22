@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from jinja2 import Template
+from jinja2 import Environment, select_autoescape
 
-from .dedup import DuplicateGroup, TrackItem
+from .dedup import DuplicateGroup
 from .utils import human_duration, human_size
-
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -107,6 +106,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .match-recording_id { background: #4ecca3; color: #000; }
   .match-fingerprint { background: #e94560; color: #fff; }
+  .match-fingerprint_similar { background: #b5651d; color: #fff; }
   .match-name { background: #f0a500; color: #000; }
   .review-tag {
     display: inline-block;
@@ -207,19 +207,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <div class="stat-card">
       <div class="stat-value">{{ total_duplicates }}</div>
-      <div class="stat-label">可删除文件数</div>
+      <div class="stat-label">默认会处理的文件数</div>
     </div>
     <div class="stat-card keep">
       <div class="stat-value">{{ wasted_size }}</div>
-      <div class="stat-label">可释放空间</div>
+      <div class="stat-label">默认可释放空间</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{{ review_groups }}</div>
+      <div class="stat-label">待人工确认的组数</div>
     </div>
   </div>
 
   <div class="apply-hint">
-    确认无误后执行：<code>music-dedup apply "{{ report_path }}"</code><br>
+    确认无误后执行：<code>music-dedup apply "{{ json_path }}"</code><br>
     这会将所有标记为"待删除"的文件移入回收站（保留每组中质量最高的一个）。<br>
-    <strong>注意：仅凭文件名匹配（黄色标签、带 ⚠ 标记）的组默认不会删除，需人工确认后加
-    <code>--include-name-matches</code> 才会处理。</strong>
+    <strong>注意：带 ⚠ 标记的组默认不会删除——仅凭文件名匹配（黄色标签）需加
+    <code>--include-name-matches</code>，仅凭指纹相似匹配（棕色标签）需加
+    <code>--include-similar-matches</code>。</strong>
   </div>
 
   <div class="filter-bar">
@@ -228,6 +233,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <option value="">全部匹配类型</option>
       <option value="recording_id">Recording ID（最精确）</option>
       <option value="fingerprint">音频指纹</option>
+      <option value="fingerprint_similar">指纹相似（同一录音的不同编码）</option>
       <option value="name">文件名</option>
     </select>
     <select id="format">
@@ -295,26 +301,42 @@ document.getElementById('format').addEventListener('change', applyFilters);
 </body>
 </html>"""
 
+# 模块级预编译：避免每次生成报告都重新解析约 290 行模板。
+# from_string 创建的模板没有名字，select_autoescape 的 default_for_string=True 会启用转义。
+_ENV = Environment(autoescape=select_autoescape(["html"]))
+_TEMPLATE = _ENV.from_string(HTML_TEMPLATE)
+
 
 def generate_report(
     groups: list[DuplicateGroup],
     total_files: int,
     report_path: Path,
+    json_path: Path | None = None,
 ) -> Path:
     """生成 HTML 重复检测报告。"""
+    # apply 命令读的是 scan 生成的 JSON，而不是这份 HTML。
+    if json_path is None:
+        json_path = report_path.with_suffix(".json")
+
     match_labels = {
         "recording_id": "Recording ID",
         "fingerprint": "音频指纹",
+        "fingerprint_similar": "指纹相似",
         "name": "文件名",
     }
+    # 这两类匹配可能误判，默认不参与删除，只在报告里提示人工确认
+    review_types = {"name", "fingerprint_similar"}
 
     rendered_groups = []
     total_duplicates = 0
     total_wasted = 0
+    review_groups = 0
+    review_files = 0
 
     for group in groups:
         files = []
         formats = set()
+        group_duplicates = 0
         for item in group.items:
             is_keep = item is group.keep
             files.append({
@@ -327,30 +349,38 @@ def generate_report(
             })
             formats.add(item.ext)
             if not is_keep:
-                total_duplicates += 1
+                group_duplicates += 1
 
-        total_wasted += group.wasted_size
+        if group.match_type in review_types:
+            review_groups += 1
+            review_files += group_duplicates
+        else:
+            total_duplicates += group_duplicates
+            total_wasted += group.wasted_size
+
         rendered_groups.append({
             "title": group.display_title,
             "artist": group.display_artist,
             "match_type": group.match_type,
             "match_label": match_labels.get(group.match_type, group.match_type),
-            "needs_review": group.match_type == "name",
+            "needs_review": group.match_type in review_types,
             "count": len(group.items),
             "wasted_size": human_size(group.wasted_size),
             "files": files,
             "formats": ",".join(sorted(formats)),
         })
 
-    template = Template(HTML_TEMPLATE)
-    html = template.render(
+    html = _TEMPLATE.render(
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total_files=total_files,
         duplicate_groups=len(groups),
         total_duplicates=total_duplicates,
         wasted_size=human_size(total_wasted),
+        review_groups=review_groups,
+        review_files=review_files,
         groups=rendered_groups,
         report_path=str(report_path),
+        json_path=str(json_path),
     )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)

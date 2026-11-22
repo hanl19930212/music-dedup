@@ -17,7 +17,10 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.setLevel(logging.DEBUG)
 
-    # 清除已有 handler，避免重复
+    # 清除已有 handler，避免重复；先关闭文件句柄，防止长驻进程里出现句柄泄漏（WinError 32）
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.close()
     logger.handlers.clear()
 
     console_handler = RichHandler(rich_tracebacks=True, show_time=False, show_path=False)
@@ -35,15 +38,6 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
     logger.addHandler(file_handler)
 
 
-# 常见歌曲标注，规范化时去除
-ANNOTATION_PATTERNS = [
-    r"\([^)]*\)",  # (Live) (伴奏) (Remix)
-    r"（[^）]*）",  # 全角括号
-    r"\[[^\]]*\]",
-    r"【[^】]*】",
-    r"\{[^}]*\}",
-]
-
 SEPARATORS = [" - ", " _ ", " — ", " – ", " 一 ", " —— ", "·", "、"]
 
 # 歌手名常见分隔前缀
@@ -57,11 +51,30 @@ MARKER_WORDS = [
     "hq", "hires", "hi-res",
 ]
 
+# 下载器/刮削失败时常见的占位标签，不参与匹配
+PLACEHOLDER_TAGS = {
+    "unknown", "untitled", "track", "audio", "music", "song", "default",
+    "title", "artist", "album",
+    "kuwo", "kuwo音乐", "酷我", "酷我音乐", "qq music", "qq音乐", "qqmusic",
+    "netease", "网易云音乐", "xiami", "虾米", "tidal", "soundcloud",
+    "未知", "无标题", "默认", "音频", "音乐", "歌名", "歌手",
+}
+
 # 副本标记（文件名末尾的拷贝标识）
 COPY_MARKERS = [
     "副本", "copy", "复件",
     r"\(\d+\)", r"（\d+）",  # (1), （1）
     r"-\s*\d+$",  # - 1, -2
+]
+
+# 片段分隔符：文件名里用来区分歌名/歌手的符号
+SEGMENT_SEPARATORS = r"[\-_—–·、－]"
+
+# 前导序号："10."、"03)"、"04、"，以及 1~3 位数字加空格（"06 歌名"）。
+# 4 位数字留给年份，所以 "2002 年的第一场雪" 不会被削掉前缀。
+LEADING_SEQUENCE_PATTERNS = [
+    re.compile(r"^\d{1,4}\s*[.、)）]\s*"),
+    re.compile(r"^\d{1,3}\s+"),
 ]
 
 
@@ -79,6 +92,18 @@ def _remove_copy_markers(name: str) -> str:
     return name.strip()
 
 
+def _strip_leading_sequence(token: str) -> str:
+    """去掉片段开头的前导序号；纯数字片段（如 "0003"）直接丢弃。"""
+    token = token.strip()
+    if not token:
+        return ""
+    if token.isdigit():
+        return ""
+    for pattern in LEADING_SEQUENCE_PATTERNS:
+        token = pattern.sub("", token, count=1)
+    return token.strip()
+
+
 def fullwidth_to_halfwidth(text: str) -> str:
     """全角字符转半角。"""
     result = []
@@ -92,16 +117,16 @@ def fullwidth_to_halfwidth(text: str) -> str:
     return "".join(result)
 
 
-def normalize_filename(name: str) -> str:
-    """将文件名规范化为可比较的形式。
+def filename_segments(name: str) -> list[str]:
+    """把文件名切成有效片段。
 
-    处理：
-    - 去掉扩展名
-    - 全角转半角
-    - 去除括号内标注
-    - 去除 feat/remix 等标记
-    - 去除常见分隔符及前后的歌手名前缀（"陈奕迅 - 十年" -> "十年"）
-    - 统一小写、去空格
+    处理：去扩展名、全角转半角、去副本标记（"副本"、"(1)"）、
+    丢弃前导序号（"0003-"、"01_"、"10."）与纯数字片段。
+
+    括号里的版本标注（"(Live)"、"(Live Version)"）和 feat/remix 等标记词会被
+    保留在片段里：它们代表不同的录音，抹掉会让现场版和录音室版被当成同一首。
+
+    返回按出现顺序排列的片段列表，调用方可以自行决定如何组合。
     """
     # 去扩展名
     name = Path(name).stem
@@ -109,36 +134,43 @@ def normalize_filename(name: str) -> str:
     # 全角转半角
     name = fullwidth_to_halfwidth(name)
 
-    # 去除括号标注
-    for pat in ANNOTATION_PATTERNS:
-        name = re.sub(pat, " ", name)
-
     # 去除副本标记（"副本"、"copy"、"(1)" 等）
     name = _remove_copy_markers(name)
 
-    # 按分隔符切分，取最后一段（通常是歌名）
-    # 先尝试常见分隔符
-    parts = [p.strip() for p in re.split(r"[\-_—–·、－]", name) if p.strip()]
-    if len(parts) > 1:
-        name = parts[-1]
+    segments: list[str] = []
+    for raw in re.split(SEGMENT_SEPARATORS, name):
+        token = _strip_leading_sequence(raw)
+        if not token:
+            continue
+        # 去除标点，保留词间空格（避免 "Hey Jude" 与 "HeyJude" 被误判为同一首）
+        token = re.sub(r"[\.,!?'\"`~@#\$%\^&\*\+=\|\\/<>:;()\[\]{}]", "", token)
+        token = token.strip("-_—–·、－ ")
+        token = re.sub(r"\s+", " ", token).strip()
+        if token:
+            segments.append(unicodedata.normalize("NFKC", token).lower())
 
-    # 去除标记词
-    for marker in MARKER_WORDS:
-        name = re.sub(rf"\b{re.escape(marker)}\b", " ", name, flags=re.IGNORECASE)
+    return segments
 
-    # 去除标点，保留词间空格（避免 "Hey Jude" 与 "HeyJude" 被误判为同一首）
-    name = re.sub(r"[\.,!?'\"`~@#\$%\^&\*\+=\|\\/<>:;]+", "", name)
 
-    # 去除首尾残留的分隔符
-    name = name.strip("-_—–·、－ ")
+def normalize_filename(name: str) -> str:
+    """将文件名规范化为可比较的形式。
 
-    # 压缩连续空白为单个空格
-    name = re.sub(r"\s+", " ", name).strip()
+    保留全部有效片段并按字典序排列，而不是只取最后一段：
+    这样 "歌名-歌手" 与 "歌手-歌名" 能归到一起，而同一位歌手的不同歌曲
+    不会因为歌手名相同被误判成重复。
+    """
+    segments = filename_segments(name)
+    if not segments:
+        return ""
+    return "|".join(sorted(segments))
 
-    # Unicode 规范化（处理组合字符）
-    name = unicodedata.normalize("NFKC", name).lower()
 
-    return name.strip()
+def is_placeholder_tag(value: str | None) -> bool:
+    """判断标签是否为无意义的占位值。"""
+    if not value:
+        return True
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    return not normalized or normalized in PLACEHOLDER_TAGS
 
 
 def normalize_artist_artist_in_path(path: Path) -> str:
