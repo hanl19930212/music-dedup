@@ -12,7 +12,15 @@ from .utils import logger
 MAX_COVER_BYTES = 8 * 1024 * 1024
 DOWNLOAD_CHUNK = 64 * 1024
 IMAGE_CONTENT_TYPES = frozenset(
-    {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}
+    {
+        "image/jpeg",
+        "image/jpg",      # 部分 CDN（如网易云）返回非标准写法
+        "image/pjpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+    }
 )
 
 
